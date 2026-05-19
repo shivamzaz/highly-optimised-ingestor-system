@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-edge-collector
+  namespace: default
+  labels:
+    app: aegis-edge
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: aegis-edge
+  template:
+    metadata:
+      labels:
+        app: aegis-edge
+    spec:
+      securityContext:
+        sysctls:
+        # Prevent RAM exhaustion by shrinking default TCP read/write buffers
+        # Note: These are unsafe sysctls and must be allowed by the kubelet.
+        - name: net.ipv4.tcp_rmem
+          value: "4096 8192 65536"
+        - name: net.ipv4.tcp_wmem
+          value: "4096 8192 65536"
+        - name: net.core.somaxconn
+          value: "65535"
+      containers:
+      - name: edge-collector
+        image: python:3.11-slim
+        # We tell the application to write the WAL files to the emptyDir mount
+        # to ensure it's backed by the physical node disk and supports posix_fallocate.
+        command: ["python", "/app/aegis_edge.py"]
+        volumeMounts:
+        - name: wal-storage
+          mountPath: /var/log/aegis_edge
+        - name: app-code
+          mountPath: /app
+        ports:
+        - containerPort: 8888
+          name: tcp-ingest
+        resources:
+          # High memory requests/limits are necessary because the OS Page Cache
+          # used by the mmap WAL counts against the container's cgroup limit.
+          requests:
+            memory: "5Gi"
+            cpu: "1000m"
+          limits:
+            memory: "8Gi"
+            cpu: "2000m"
+      volumes:
+      # Use emptyDir to bypass the container's OverlayFS root filesystem
+      - name: wal-storage
+        emptyDir: {}
+      - name: app-code
+        configMap:
+          name: aegis-code-cm
