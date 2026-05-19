@@ -1,0 +1,22 @@
+[Unit]
+Description=Aegis Edge Ingestion mmap WAL Collector
+After=network.target
+
+[Service]
+Type=simple
+User=aegis_daemon
+ExecStart=/usr/bin/python3 /opt/aegis/aegis_edge.py
+
+# --- THE CRITICAL TUNING DIRECTIVE ---
+# Overrides systemd's default 1024 limit, allowing up to 100,000 open file descriptors.
+# Essential for handling thousands of persistent Keep-Alive connections.
+LimitNOFILE=100000
+
+# Ensure systemd doesn't limit memory locking (good for mmap)
+LimitMEMLOCK=infinity
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

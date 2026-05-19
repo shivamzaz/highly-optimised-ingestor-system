@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+Aegis Edge Collector - High-Throughput Edge Ingestion
+-------------------------------------------------------
+Use Case:
+This application is designed to receive high-frequency telemetry data from thousands of edge
+devices (e.g., IoT sensors, manufacturing equipment) over long-lived (Keep-Alive) TCP connections.
+It uses an asynchronous event loop (asyncio) to manage the massive concurrent connections efficiently,
+and memory-mapped (mmap) Write-Ahead Logs (WAL) to persist data at near-RAM latency, bypassing standard
+OS disk I/O bottlenecks.
+
+Architecture:
+- Shared-Nothing WAL: Each worker process maintains its own dedicated mmap WAL file.
+- Zero-Copy Writes: Payloads are written directly to the OS Page Cache.
+- Async I/O: Handles persistent connections without thread starvation.
+
+Usage:
+  python3 aegis_edge.py [OPTIONS]
+
+Options:
+  --dry-run   Run the server without actually mapping files or listening on ports.
+              Useful for validating syntax and limits.
+"""
+
+import argparse
+import asyncio
+import logging
+import mmap
+import os
+import resource
+import struct
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] [PID %(process)d] %(message)s')
+
+class PartitionedMmapWAL:
+    # 8 bytes for an unsigned long long (Q) to store the write offset.
+    # This header acts as the single source of truth for the file's state.
+    HEADER_FORMAT = "<Q"
+    HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+
+    def __init__(self, filepath: str, max_size_mb: int = 100, dry_run: bool = False):
+        self.filepath = filepath
+        self.max_size = max_size_mb * 1024 * 1024
+        self.dry_run = dry_run
+
+        if self.dry_run:
+            logging.info(f"[DRY-RUN] Would create mmap WAL at {self.filepath} ({max_size_mb}MB)")
+            self.current_offset = self.HEADER_SIZE
+            return
+
+        is_new = not os.path.exists(filepath)
+        self.fd = os.open(filepath, os.O_CREAT | os.O_RDWR)
+
+        if is_new:
+            # os.posix_fallocate allocates actual disk blocks instantly,
+            # preventing fragmentation and OS pauses during traffic spikes.
+            if hasattr(os, 'posix_fallocate'):
+                try:
+                    os.posix_fallocate(self.fd, 0, self.max_size)
+                except OSError as e:
+                    logging.warning(f"posix_fallocate failed: {e}. Falling back to ftruncate.")
+                    os.ftruncate(self.fd, self.max_size)
+            else:
+                os.ftruncate(self.fd, self.max_size)
+
+        # Memory-map the file
+        self.mmap_obj = mmap.mmap(self.fd, self.max_size, access=mmap.ACCESS_WRITE)
+
+        if is_new:
+            self.current_offset = self.HEADER_SIZE
+            self._write_header()
+        else:
+            self.current_offset = struct.unpack(self.HEADER_FORMAT, self.mmap_obj[:self.HEADER_SIZE])[0]
+
+    def _write_header(self):
+        if not self.dry_run:
+            self.mmap_obj[:self.HEADER_SIZE] = struct.pack(self.HEADER_FORMAT, self.current_offset)
+
+    def append(self, payload: bytes) -> bool:
+        """
+        Appends data to the mmap file.
+        Format per record: [4 bytes payload length] + [Payload bytes]
+        """
+        payload_len = len(payload)
+        record_format = f"<I{payload_len}s"
+        record_data = struct.pack(record_format, payload_len, payload)
+        record_size = len(record_data)
+
+        if self.current_offset + record_size > self.max_size:
+            logging.warning(f"WAL {self.filepath} is full. Rotation needed.")
+            return False
+
+        if self.dry_run:
+            self.current_offset += record_size
+            return True
+
+        end_offset = self.current_offset + record_size
+        self.mmap_obj[self.current_offset:end_offset] = record_data
+
+        self.current_offset = end_offset
+        self._write_header()
+
+        return True
+
+    def force_flush(self):
+        if not self.dry_run:
+            self.mmap_obj.flush()
+
+    def close(self):
+        if not self.dry_run:
+            self.force_flush()
+            self.mmap_obj.close()
+            os.close(self.fd)
+
+def verify_system_limits():
+    """Verify system file descriptor limits to ensure it can handle high concurrency."""
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit < 50000:
+        logging.warning(f"FD Limit is low ({soft_limit}). High throughput may cause 'Too many open files' errors.")
+    else:
+        logging.info(f"System limits verified. Max open files: {soft_limit}")
+
+class EdgeCollectorServer:
+    def __init__(self, host='0.0.0.0', port=8888, max_requests_per_conn=1000, wal_dir="/var/log/aegis_edge", dry_run=False):
+        self.host = host
+        self.port = port
+        self.max_requests_per_conn = max_requests_per_conn
+        self.wal_dir = wal_dir
+        self.dry_run = dry_run
+
+        if not self.dry_run:
+            os.makedirs(self.wal_dir, exist_ok=True)
+
+        pid = os.getpid()
+        self.wal_file = os.path.join(self.wal_dir, f"wal_worker_{pid}.dat")
+        self.wal = PartitionedMmapWAL(self.wal_file, max_size_mb=100, dry_run=self.dry_run)
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        client_addr = writer.get_extra_info('peername')
+        logging.info(f"New connection from {client_addr}")
+        request_count = 0
+
+        try:
+            while request_count < self.max_requests_per_conn:
+                length_bytes = await reader.readexactly(4)
+                if not length_bytes:
+                    break
+
+                payload_len = struct.unpack('<I', length_bytes)[0]
+                payload = await reader.readexactly(payload_len)
+
+                success = self.wal.append(payload)
+                if not success:
+                    break
+
+                request_count += 1
+
+        except asyncio.IncompleteReadError:
+            pass
+        except Exception as e:
+            logging.error(f"Connection error from {client_addr}: {e}")
+        finally:
+            logging.info(f"Closing connection {client_addr} after {request_count} requests")
+            writer.close()
+            await writer.wait_closed()
+
+    async def run(self):
+        if self.dry_run:
+            logging.info(f"[DRY-RUN] Server would listen on {self.host}:{self.port}")
+            # Keep alive slightly in dry-run to prove it works
+            await asyncio.sleep(2)
+            return
+
+        server = await asyncio.start_server(self.handle_client, self.host, self.port)
+        logging.info(f"Server listening on {self.host}:{self.port} with WAL {self.wal_file}")
+
+        async with server:
+            await server.serve_forever()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Aegis Edge Collector")
+    parser.add_argument('--dry-run', action='store_true', help='Run in dry-run mode without I/O or binding ports')
+    args = parser.parse_args()
+
+    verify_system_limits()
+    collector = EdgeCollectorServer(dry_run=args.dry_run)
+    try:
+        asyncio.run(collector.run())
+        if args.dry_run:
+            logging.info("[DRY-RUN] Dry run completed successfully.")
+    except KeyboardInterrupt:
+        logging.info("Shutting down...")
+    finally:
+        collector.wal.close()
